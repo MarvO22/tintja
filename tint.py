@@ -46,7 +46,9 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 VK_Q = 0x51
+VK_I = 0x49
 HOTKEY_QUIT = 1
+HOTKEY_ICONS = 2
 
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
@@ -202,8 +204,8 @@ user32.DestroyWindow.restype = ctypes.c_bool
 user32.ShowWindow.argtypes = [c_void_p, c_int]
 user32.ShowWindow.restype = ctypes.c_bool
 user32.UpdateLayeredWindow.argtypes = [
-    c_void_p, c_void_p, POINTER(POINT), POINTER(SIZE),
-    c_void_p, POINTER(POINT), c_uint32, POINTER(BLENDFUNCTION), c_uint32,
+    c_void_p, c_void_p, c_void_p, c_void_p,
+    c_void_p, c_void_p, c_uint32, c_void_p, c_uint32,
 ]
 user32.UpdateLayeredWindow.restype = ctypes.c_bool
 user32.GetDC.argtypes = [c_void_p]
@@ -221,7 +223,7 @@ user32.UnregisterHotKey.restype = ctypes.c_bool
 
 gdi32.CreateCompatibleDC.argtypes = [c_void_p]
 gdi32.CreateCompatibleDC.restype = c_void_p
-gdi32.CreateDIBSection.argtypes = [c_void_p, POINTER(BITMAPINFOHEADER), c_uint, POINTER(c_void_p), c_void_p, c_uint32]
+gdi32.CreateDIBSection.argtypes = [c_void_p, c_void_p, c_uint, POINTER(c_void_p), c_void_p, c_uint32]
 gdi32.CreateDIBSection.restype = c_void_p
 gdi32.SelectObject.argtypes = [c_void_p, c_void_p]
 gdi32.SelectObject.restype = c_void_p
@@ -727,6 +729,12 @@ def main() -> None:
         print("Quit hotkey is already taken. Close this window to stop.", flush=True)
     else:
         print("tintja. Ctrl+Alt+Shift+Q quits.", flush=True)
+    icons_toggle = user32.RegisterHotKey(None, HOTKEY_ICONS, MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_I)
+    if icons_toggle:
+        print("Taskbar icons on. Ctrl+Alt+Shift+I toggles them.", flush=True)
+
+    from taskbar import TaskbarTints
+    taskbar = TaskbarTints()
 
     overlays: dict[int, Overlay] = {}
     # A short beat so a window that is still opening is not treated as closed.
@@ -737,6 +745,10 @@ def main() -> None:
             while user32.PeekMessageW(byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_QUIT:
                     return
+                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ICONS:
+                    state = "on" if taskbar.toggle() else "off"
+                    print(f"Taskbar icons {state}.", flush=True)
+                    continue
                 user32.TranslateMessage(byref(msg))
                 user32.DispatchMessageW(byref(msg))
 
@@ -767,12 +779,16 @@ def main() -> None:
                 if rect is not None:
                     overlay.sync(rect, style)
 
+            taskbar.update(SHELLS.apps)
+
             for hwnd in list(overlays):
                 if hwnd not in live or not user32.IsWindow(hwnd):
                     overlays.pop(hwnd).close()
             time.sleep(0.03)
     finally:
         user32.UnregisterHotKey(None, HOTKEY_QUIT)
+        user32.UnregisterHotKey(None, HOTKEY_ICONS)
+        taskbar.close()
         for overlay in overlays.values():
             overlay.close()
 

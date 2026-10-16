@@ -18,7 +18,7 @@ Windows and Python 3.
 python tint.py
 ```
 
-`Ctrl+Alt+Shift+Q` quits.
+`Ctrl+Alt+Shift+Q` quits. `Ctrl+Alt+Shift+I` toggles the taskbar icon tint.
 
 ## Startup
 
