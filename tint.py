@@ -79,9 +79,10 @@ PM_REMOVE = 0x0001
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ALREADY_EXISTS = 183
 
-BAR_DIP = 28
-RAIL_DIP = 6
-EDGE_DIP = 3
+BAR_DIP = 30
+RAIL_DIP = 8
+EDGE_DIP = 5
+DWMWA_CAPTION_BUTTON_BOUNDS = 5
 
 
 class RECT(ctypes.Structure):
@@ -398,6 +399,15 @@ def frame_rect(hwnd: int) -> RECT | None:
     return rect
 
 
+def title_bar_height(hwnd: int, dpi: int) -> int:
+    rect = RECT()
+    if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, byref(rect), sizeof(rect)) == 0:
+        height = rect.bottom - rect.top
+        if 20 <= height <= 80:
+            return height
+    return dip(BAR_DIP, dpi)
+
+
 def is_cloaked(hwnd: int) -> bool:
     cloaked = c_int()
     if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, byref(cloaked), sizeof(cloaked)) != 0:
@@ -582,7 +592,7 @@ class Overlay:
         font = c_void_p()
         fmt = c_void_p()
         dpi = user32.GetDpiForWindow(self.target) or 96
-        bar = min(dip(BAR_DIP, dpi), max(1, height // 5))
+        bar = min(title_bar_height(self.target, dpi), max(1, height // 5))
         rail_w = min(dip(RAIL_DIP, dpi), max(1, width // 8))
         edge = dip(EDGE_DIP, dpi)
         status = gdiplus.GdipCreateBitmapFromScan0(
@@ -597,10 +607,11 @@ class Overlay:
             gdiplus.GdipSetSmoothingMode(graphics, 4)
             gdiplus.GdipSetTextRenderingHint(graphics, 4)
             rgb = self.style.color
-            fill(graphics, argb(0x66, rgb), 0, 0, width, bar)
-            fill(graphics, argb(0xE6, rgb), 0, 0, rail_w, height)
+            # 10% wash across the real title bar. File, Edit, and the rest stay readable.
+            fill(graphics, argb(0x1A, rgb), 0, 0, width, bar)
+            fill(graphics, argb(0xE6, rgb), 0, bar, rail_w, height - bar)
             fill(graphics, argb(0xB0, rgb), 0, height - edge, width, edge)
-            fill(graphics, argb(0xB0, rgb), width - edge, 0, edge, height)
+            fill(graphics, argb(0xB0, rgb), width - edge, bar, edge, height - bar)
             family = font_family(self.style.fonts)
             if gdiplus.GdipCreateFont(family, float(dip(13, dpi)), 1, 2, byref(font)) != 0:
                 return
@@ -616,15 +627,14 @@ class Overlay:
                 graphics, self.style.label, -1, font, byref(layout), fmt,
                 byref(measured), byref(chars), byref(lines),
             )
-            pad_x = dip(8, dpi)
-            pad_y = dip(3, dpi)
-            pill_x = float(rail_w + dip(10, dpi))
-            pill_w = measured.w + pad_x * 2
-            pill_h = max(measured.h, float(dip(18, dpi))) + pad_y
-            pill_y = max(0.0, (bar - pill_h) / 2)
-            fill(graphics, argb(0xF0, rgb), pill_x, pill_y, pill_w, pill_h)
+            pad_x = dip(6, dpi)
+            overrun = dip(8, dpi)
+            if self.style.key == "cursor.exe":
+                overrun += dip(5, dpi)
+            pill_w = min(float(width), measured.w + pad_x + overrun)
+            fill(graphics, argb(0xFF, rgb), 0, 0, pill_w, bar)
             if gdiplus.GdipCreateSolidFill(argb(0xFF, 0xFFFFFF), byref(text_brush)) == 0:
-                text_rect = RectF(pill_x + pad_x, pill_y, measured.w + 4, pill_h)
+                text_rect = RectF(float(pad_x), 0, measured.w + 2, float(bar))
                 gdiplus.GdipDrawString(graphics, self.style.label, -1, font, byref(text_rect), fmt, text_brush)
         finally:
             if text_brush:
