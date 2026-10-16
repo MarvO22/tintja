@@ -77,6 +77,7 @@ PIXEL_FORMAT_32BPP_PARGB = 0x000E200B
 
 PM_REMOVE = 0x0001
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_ALREADY_EXISTS = 183
 
 BAR_DIP = 28
 RAIL_DIP = 6
@@ -424,13 +425,13 @@ def load_shells(raw: dict) -> dict[str, AppStyle]:
             continue
         fonts = entry.get("fonts") or ["Segoe UI"]
         skips = entry.get("skip_if_path_contains") or []
-        label = str(entry.get("label") or process)
+        label = str(entry.get("label") or process)[:40]
         apps[process] = AppStyle(
             process,
             label,
             parse_rgb(entry.get("color", "blue"), palette),
-            tuple(str(font) for font in fonts),
-            tuple(str(skip).lower() for skip in skips),
+            tuple(str(font)[:80] for font in list(fonts)[:4]),
+            tuple(str(skip).lower()[:80] for skip in list(skips)[:8]),
         )
     return apps
 
@@ -446,6 +447,8 @@ class ShellBook:
         mtime = CONFIG_PATH.stat().st_mtime
         if mtime == self._mtime:
             return False
+        if CONFIG_PATH.stat().st_size > 65_536:
+            raise ValueError("shells.json is too large")
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         self.apps = load_shells(raw)
         self._mtime = mtime
@@ -466,34 +469,48 @@ def style_for_path(path: str) -> AppStyle | None:
     return style
 
 
-def find_targets() -> list[tuple[int, AppStyle, str]]:
+MAX_BITMAP_EDGE = 8192
+
+
+def find_targets() -> tuple[list[tuple[int, AppStyle, str]], bool]:
+    """Return windows to paint, and whether any shell window still exists.
+
+    A minimized window still counts as open. A closed one does not.
+    """
     found: list[tuple[int, AppStyle, str]] = []
+    any_open = False
 
     def visit(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        nonlocal any_open
+        if user32.GetWindow(hwnd, GW_OWNER) or is_cloaked(hwnd):
             return True
-        if user32.GetWindow(hwnd, GW_OWNER):
-            return True
-        if is_cloaked(hwnd):
+        iconic = bool(user32.IsIconic(hwnd))
+        if not iconic and not user32.IsWindowVisible(hwnd):
             return True
         title = window_title(hwnd)
         if not title:
             return True
-        path = process_path(hwnd)
-        style = style_for_path(path)
+        style = style_for_path(process_path(hwnd))
         if style is None:
+            return True
+        if iconic:
+            any_open = True
             return True
         rect = frame_rect(hwnd)
         if rect is None:
             return True
-        if rect.right - rect.left < 480 or rect.bottom - rect.top < 320:
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width < 480 or height < 320:
             return True
+        if width > MAX_BITMAP_EDGE or height > MAX_BITMAP_EDGE:
+            return True
+        any_open = True
         found.append((hwnd, style, title))
         return True
 
-    callback = WNDENUMPROC(visit)
-    user32.EnumWindows(callback, 0)
-    return found
+    user32.EnumWindows(WNDENUMPROC(visit), 0)
+    return found, any_open
 
 
 class Overlay:
@@ -670,7 +687,18 @@ def fill(graphics, color, x, y, w, h) -> None:
     gdiplus.GdipDeleteBrush(brush)
 
 
+def claim_single_instance() -> bool:
+    kernel32.CreateMutexW.argtypes = [c_void_p, ctypes.c_bool, c_wchar_p]
+    kernel32.CreateMutexW.restype = c_void_p
+    kernel32.GetLastError.restype = c_uint32
+    kernel32.CreateMutexW(None, False, "Local\\tintja")
+    return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+
+
 def main() -> None:
+    if not claim_single_instance():
+        print("tintja is already running.", flush=True)
+        return
     start_gdiplus()
 
     def wndproc(hwnd, msg, wparam, lparam):
@@ -691,6 +719,8 @@ def main() -> None:
         print("tintja. Ctrl+Alt+Shift+Q quits.", flush=True)
 
     overlays: dict[int, Overlay] = {}
+    # A short beat so a window that is still opening is not treated as closed.
+    closed_since: float | None = None
     try:
         while True:
             msg = MSG()
@@ -706,8 +736,17 @@ def main() -> None:
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 print(f"Could not read {CONFIG_PATH.name}: {exc}", flush=True)
 
+            targets, any_open = find_targets()
+            if any_open:
+                closed_since = None
+            else:
+                closed_since = time.monotonic() if closed_since is None else closed_since
+                if time.monotonic() - closed_since >= 2:
+                    print("Shell windows are closed. tintja is stopping.", flush=True)
+                    return
+
             live: set[int] = set()
-            for hwnd, style, _title in find_targets():
+            for hwnd, style, _title in targets:
                 live.add(hwnd)
                 overlay = overlays.get(hwnd)
                 if overlay is None:

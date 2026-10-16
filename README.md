@@ -20,6 +20,10 @@ python tint.py
 
 `Ctrl+Alt+Shift+Q` quits.
 
+## Startup
+
+`launch.py` is started when you sign in to Windows. When a Cursor, Claude, or ChatGPT window is open, it starts tintja if the shells are not already up. Minimized windows keep tintja running. Once every one of those windows is closed, tintja quits. The Claude Code helper is ignored.
+
 ## Change a shell
 
 Edit `shells.json`. A color can be `blue`, `red`, `orange`, `purple`, or `green`, or a hex code like `#2E6BFF`. You can change the hex behind a name, point an app at a different name, change its typeface, or add another app by its `.exe` name. Save the file and the shells update on their own.
