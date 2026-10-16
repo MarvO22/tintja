@@ -1,0 +1,30 @@
+{
+  "colors": {
+    "blue": "#2E6BFF",
+    "red": "#E23B3B",
+    "orange": "#F47B20",
+    "purple": "#7B3FF2",
+    "green": "#10A37F"
+  },
+  "apps": [
+    {
+      "process": "cursor.exe",
+      "label": "Cursor",
+      "color": "purple",
+      "fonts": ["Segoe UI", "Arial"]
+    },
+    {
+      "process": "claude.exe",
+      "label": "Claude",
+      "color": "blue",
+      "fonts": ["Georgia", "Palatino Linotype", "Times New Roman"],
+      "skip_if_path_contains": ["claude-code"]
+    },
+    {
+      "process": "chatgpt.exe",
+      "label": "ChatGPT",
+      "color": "green",
+      "fonts": ["Cascadia Mono", "Consolas", "Courier New"]
+    }
+  ]
+}
