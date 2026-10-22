@@ -367,10 +367,11 @@ def main() -> None:
     except (json.JSONDecodeError, OSError, ValueError):
         pass
     finally:
-        # Cursor waits on its hooks and reads a JSON answer. Claude Code
-        # accepts an empty object.
-        event = payload.get("hook_event_name") if isinstance(payload, dict) else None
-        print(json.dumps({"continue": True} if event == "beforeSubmitPrompt" else {}), flush=True)
+        # Cursor waits on its hooks and reads a JSON answer. Claude Code gets
+        # nothing, so nothing is ever added to its prompt.
+        event = str(payload.get("hook_event_name") or "") if isinstance(payload, dict) else ""
+        if not event[:1].isupper():
+            print(json.dumps({"continue": True} if event == "beforeSubmitPrompt" else {}), flush=True)
 
 
 if __name__ == "__main__":
