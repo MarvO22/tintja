@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -49,8 +50,10 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 VK_Q = 0x51
 VK_I = 0x49
+VK_D = 0x44
 HOTKEY_QUIT = 1
 HOTKEY_ICONS = 2
+HOTKEY_TUNE = 3
 
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
@@ -58,6 +61,7 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
+SW_HIDE = 0
 SW_SHOWNOACTIVATE = 4
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
@@ -71,6 +75,9 @@ GWL_EXSTYLE = -20
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_DONOTROUND = 1
+DWMWCP_ROUNDSMALL = 3
 
 BI_RGB = 0
 DIB_RGB_COLORS = 0
@@ -84,8 +91,8 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ALREADY_EXISTS = 183
 
 BAR_DIP = 30
-RAIL_DIP = 8
-EDGE_DIP = 5
+BORDER_DIP = 5
+BORDER_ALPHA = 0xD8
 DWMWA_CAPTION_BUTTON_BOUNDS = 5
 
 
@@ -191,6 +198,11 @@ user32.IsWindow.argtypes = [c_void_p]
 user32.IsWindow.restype = ctypes.c_bool
 user32.IsIconic.argtypes = [c_void_p]
 user32.IsIconic.restype = ctypes.c_bool
+user32.IsZoomed.argtypes = [c_void_p]
+user32.IsZoomed.restype = ctypes.c_bool
+user32.GetForegroundWindow.restype = c_void_p
+user32.SetForegroundWindow.argtypes = [c_void_p]
+user32.SetForegroundWindow.restype = ctypes.c_bool
 user32.GetWindow.argtypes = [c_void_p, c_uint]
 user32.GetWindow.restype = c_void_p
 user32.GetWindowThreadProcessId.argtypes = [c_void_p, POINTER(c_uint32)]
@@ -302,6 +314,8 @@ class AppStyle:
     color: int  # 0xRRGGBB
     fonts: tuple[str, ...]
     skip_path_contains: tuple[str, ...] = ()
+    # Extra width for the name tag, in DIPs, on top of what tintja measures.
+    name_cover: float = 0.0
 
 
 HERE = Path(__file__).resolve().parent
@@ -429,6 +443,12 @@ def parse_rgb(value: object, palette: dict[str, int]) -> int:
     raise ValueError(f"unknown color {value!r}")
 
 
+def _number(value: object, default: float, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return min(high, max(low, float(value)))
+
+
 def load_shells(raw: dict) -> dict[str, AppStyle]:
     palette_raw = raw.get("colors") or DEFAULT_CONFIG["colors"]
     palette = {str(name).strip().lower(): parse_rgb(hex_color, {}) for name, hex_color in palette_raw.items()}
@@ -446,6 +466,7 @@ def load_shells(raw: dict) -> dict[str, AppStyle]:
             parse_rgb(entry.get("color", "blue"), palette),
             tuple(str(font)[:80] for font in list(fonts)[:4]),
             tuple(str(skip).lower()[:80] for skip in list(skips)[:8]),
+            _number(entry.get("name_cover"), 0.0, -40.0, 120.0),
         )
     return apps
 
@@ -453,6 +474,9 @@ def load_shells(raw: dict) -> dict[str, AppStyle]:
 class ShellBook:
     def __init__(self) -> None:
         self.apps: dict[str, AppStyle] = {}
+        # Space between the taskbar icon and the working dot, in DIPs.
+        self.dot_gap = 1.5
+        self.corner_radius: float | None = None
         self._mtime: float | None = None
 
     def ensure(self) -> bool:
@@ -465,6 +489,10 @@ class ShellBook:
             raise ValueError("shells.json is too large")
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         self.apps = load_shells(raw)
+        self.dot_gap = _number(raw.get("dot_gap"), 1.5, -8.0, 16.0)
+        # None follows each window's own corners.
+        radius = raw.get("corner_radius")
+        self.corner_radius = _number(radius, 8.0, 0.0, 32.0) if radius is not None else None
         self._mtime = mtime
         return True
 
@@ -547,6 +575,36 @@ class Overlay:
         self.old_bitmap = None
         self.size = (0, 0)
         self.origin = (0, 0)
+        # The app's own title bar, measured from the screen while the window
+        # is in front: its height, and the left and right edge of each icon
+        # or word along it.
+        self.title: tuple[int, tuple[tuple[int, int], ...]] | None = None
+        self.measure_after = time.monotonic() + 2
+        self._look: tuple | None = None
+
+    def measure_title(self, rect: RECT) -> bool:
+        """Read the left end of the title bar, with this shell hidden.
+
+        Only call this while the window is in front, so nothing covers it.
+        Returns False when the reading could not be used.
+        """
+        from taskbar import capture, settle
+
+        dpi = user32.GetDpiForWindow(self.target) or 96
+        caption = title_bar_height(self.target, dpi)
+        width = min(rect.right - rect.left, dip(420, dpi))
+        height = min(rect.bottom - rect.top, caption * 2 + dip(16, dpi))
+        user32.ShowWindow(self.hwnd, SW_HIDE)
+        settle()
+        try:
+            data = capture(rect.left, rect.top, width, height)
+        finally:
+            user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        if not data:
+            return False
+        bar = title_height(data, width, height, caption) or caption
+        self.title = (bar, tuple(title_items(data, width, bar, dpi)))
+        return True
 
     def close(self) -> None:
         self._free_bitmap()
@@ -585,8 +643,17 @@ class Overlay:
             raise RuntimeError("CreateDIBSection failed")
         self.old_bitmap = gdi32.SelectObject(self.mem_dc, self.bitmap)
         self._paint(bits, width, height)
+        from taskbar import round_corners
+
+        radius = self._look[0] if self._look else 0
+        dpi = user32.GetDpiForWindow(self.target) or 96
+        border_corners(bits, width, height, self._border(width, dpi), radius, self.style.color)
+        round_corners(bits, width, height, radius)
         self.size = (width, height)
         return bits
+
+    def _border(self, width: int, dpi: int) -> int:
+        return min(dip(BORDER_DIP, dpi), max(1, width // 8))
 
     def _paint(self, bits: c_void_p, width: int, height: int) -> None:
         image = c_void_p()
@@ -596,9 +663,12 @@ class Overlay:
         font = c_void_p()
         fmt = c_void_p()
         dpi = user32.GetDpiForWindow(self.target) or 96
-        bar = min(title_bar_height(self.target, dpi), max(1, height // 5))
-        rail_w = min(dip(RAIL_DIP, dpi), max(1, width // 8))
-        edge = dip(EDGE_DIP, dpi)
+        bar = self.title[0] if self.title else title_bar_height(self.target, dpi)
+        bar = min(bar, max(1, height // 5))
+        border = self._border(width, dpi)
+        # The bottom corners are drawn pixel by pixel in border_corners, so
+        # the straight runs stop short of them.
+        corner = min(max(self._look[0] if self._look else 0, border), width // 2, height - bar)
         status = gdiplus.GdipCreateBitmapFromScan0(
             width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, bits, byref(image)
         )
@@ -613,9 +683,10 @@ class Overlay:
             rgb = self.style.color
             # 10% wash across the real title bar. File, Edit, and the rest stay readable.
             fill(graphics, argb(0x1A, rgb), 0, 0, width, bar)
-            fill(graphics, argb(0xE6, rgb), 0, bar, rail_w, height - bar)
-            fill(graphics, argb(0xB0, rgb), 0, height - edge, width, edge)
-            fill(graphics, argb(0xB0, rgb), width - edge, bar, edge, height - bar)
+            # One border, the same width and strength on the left, right, and bottom.
+            fill(graphics, argb(BORDER_ALPHA, rgb), 0, bar, border, height - bar - corner)
+            fill(graphics, argb(BORDER_ALPHA, rgb), width - border, bar, border, height - bar - corner)
+            fill(graphics, argb(BORDER_ALPHA, rgb), corner, height - border, width - 2 * corner, border)
             family = font_family(self.style.fonts)
             if gdiplus.GdipCreateFont(family, float(dip(13, dpi)), 1, 2, byref(font)) != 0:
                 return
@@ -632,10 +703,14 @@ class Overlay:
                 byref(measured), byref(chars), byref(lines),
             )
             pad_x = dip(6, dpi)
-            overrun = dip(8, dpi)
-            if self.style.key == "cursor.exe":
-                overrun += dip(5, dpi)
-            pill_w = min(float(width), measured.w + pad_x + overrun)
+            extra = self.style.name_cover * dpi / 96
+            if self.title is not None:
+                pill_w = tag_width(measured.w, pad_x, list(self.title[1]), extra, dpi)
+            else:
+                pill_w = measured.w + pad_x + dip(8, dpi) + extra
+                if self.style.key == "cursor.exe":
+                    pill_w += dip(5, dpi)
+            pill_w = min(float(width), max(measured.w + pad_x, pill_w))
             fill(graphics, argb(0xFF, rgb), 0, 0, pill_w, bar)
             if gdiplus.GdipCreateSolidFill(argb(0xFF, 0xFFFFFF), byref(text_brush)) == 0:
                 text_rect = RectF(float(pad_x), 0, measured.w + 2, float(bar))
@@ -655,8 +730,10 @@ class Overlay:
                 gdiplus.GdipDisposeImage(image)
 
     def sync(self, rect: RECT, style: AppStyle) -> None:
-        if style != self.style:
+        look = (corner_radius(self.target), self.title)
+        if style != self.style or look != self._look:
             self.style = style
+            self._look = look
             self.size = (0, 0)
         width = rect.right - rect.left
         height = rect.bottom - rect.top
@@ -691,6 +768,135 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, insert_after, 0, 0, 0, 0, flags)
 
 
+def corner_radius(hwnd: int) -> int:
+    """How round the window's corners are, in pixels.
+
+    Windows 11 rounds windows by 8 DIPs, or 4 for small rounding, and leaves
+    maximized windows square. Windows 10 does not round at all.
+    """
+    if user32.IsZoomed(hwnd):
+        return 0
+    dpi = user32.GetDpiForWindow(hwnd) or 96
+    if SHELLS.corner_radius is not None:
+        return dip(SHELLS.corner_radius, dpi) if SHELLS.corner_radius > 0 else 0
+    preference = c_int()
+    if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, byref(preference), sizeof(preference)) != 0:
+        return 0
+    if preference.value == DWMWCP_DONOTROUND:
+        return 0
+    return dip(4 if preference.value == DWMWCP_ROUNDSMALL else 8, dpi)
+
+
+def border_corners(bits: c_void_p, width: int, height: int, border: int, radius: int, rgb: int) -> None:
+    """Draw the border around the two bottom corners at an even thickness.
+
+    The border's outside follows the window's rounded corner, and its inside
+    follows a smaller curve from the same center, so the band keeps its width
+    all the way around. Edge pixels get partial coverage to stay smooth.
+    """
+    size = min(max(radius, border), width // 2, height)
+    if size <= 0:
+        return
+    pixels = (ctypes.c_ubyte * (width * height * 4)).from_address(bits.value)
+    inner = max(radius - border, 0)
+    color = ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)
+
+    def cover(r: float, cx: float, cy: float, px: float, py: float) -> float:
+        # How much of a pixel at (px, py) is inside a circle's quarter.
+        return min(1.0, max(0.0, r + 0.5 - math.hypot(px - cx, py - cy)))
+
+    for j in range(size):
+        y = height - 1 - j
+        py = y + 0.5
+        for i in range(size):
+            px = i + 0.5
+            outside = cover(radius, radius, height - radius, px, py) if radius > 0 and px < radius and py > height - radius else 1.0
+            if px < border or py > height - border:
+                within = 0.0
+            elif inner > 0 and px < border + inner and py > height - border - inner:
+                within = cover(inner, border + inner, height - border - inner, px, py)
+            else:
+                within = 1.0
+            amount = max(0.0, outside - within)
+            alpha = BORDER_ALPHA * amount
+            # Premultiplied blue, green, red, alpha.
+            value = bytes((round(color[2] * alpha / 255), round(color[1] * alpha / 255), round(color[0] * alpha / 255), round(alpha)))
+            for x in (i, width - 1 - i):
+                at = (y * width + x) * 4
+                pixels[at:at + 4] = value
+
+
+# A title-bar pixel belongs to an icon or word when a channel is this far
+# from the bar's color. Dimmed items, like a grayed-out back arrow, count.
+TITLE_CONTRAST = 24
+
+
+def title_height(data: bytes, w: int, h: int, caption: int) -> int | None:
+    """How tall the app's own title bar is, from where its color ends.
+
+    Apps that draw their own title bar often make it taller than Windows'
+    caption buttons. The bar ends at the first row, below the middle of the
+    caption, whose color moves away from the top row's.
+    """
+    from taskbar import _pixel, median_color
+
+    columns = range(w // 3, w, 3)
+    if len(columns) < 8:
+        return None
+    top = median_color([_pixel(data, w, x, 2) for x in columns])
+    for y in range(max(4, caption // 2), h):
+        row = median_color([_pixel(data, w, x, y) for x in columns])
+        if max(abs(a - b) for a, b in zip(row, top)) > 4:
+            return y
+    return None
+
+
+def title_items(data: bytes, w: int, h: int, dpi: int) -> list[tuple[int, int]]:
+    """Left and right edges of each icon or word along the title bar.
+
+    Letters in a word sit closer together than the gap between two words,
+    so a clear run of 5 DIPs ends an item.
+    """
+    from taskbar import _pixel, median_color
+
+    if w < 16 or h < 8:
+        return []
+    bg = median_color([_pixel(data, w, x, y) for x in range(0, w, 3) for y in (1, h - 2)])
+    rows = range(max(1, h // 6), h - max(1, h // 6))
+
+    def marked(x: int) -> bool:
+        return any(max(abs(a - b) for a, b in zip(_pixel(data, w, x, y), bg)) > TITLE_CONTRAST for y in rows)
+
+    items: list[tuple[int, int]] = []
+    start = end = None
+    clear = 0
+    for x in range(dip(2, dpi), w):
+        if marked(x):
+            if start is None:
+                start = x
+            end, clear = x + 1, 0
+        elif start is not None:
+            clear += 1
+            if clear >= dip(5, dpi):
+                items.append((start, end))
+                start = None
+    if start is not None:
+        items.append((start, end))
+    return items
+
+
+def tag_width(text_w: float, pad: float, items: list[tuple[int, int]], extra: float, dpi: int) -> float:
+    """Name tag width: room for the label, covering the app's own logo, and
+    never ending partway through an icon or word."""
+    want = text_w + pad + dip(8, dpi) + extra
+    if items and items[0][0] < dip(48, dpi):
+        want = max(want, items[0][1] + dip(4, dpi))
+    for start, end in items:
+        if start <= want < end + dip(3, dpi):
+            want = end + dip(4, dpi)
+    return max(text_w + pad, want)
+
+
 def fill(graphics, color, x, y, w, h) -> None:
     if w <= 0 or h <= 0:
         return
@@ -699,6 +905,61 @@ def fill(graphics, color, x, y, w, h) -> None:
         return
     gdiplus.GdipFillRectangle(graphics, brush, float(x), float(y), float(w), float(h))
     gdiplus.GdipDeleteBrush(brush)
+
+
+def measure_in_front(overlays: dict[int, "Overlay"]) -> None:
+    """Measure the title bar of whichever shelled window is in front.
+
+    A window is only read while it is the foreground window, so another
+    window or a game can never be mistaken for its title bar.
+    """
+    front = user32.GetForegroundWindow()
+    overlay = overlays.get(front)
+    now = time.monotonic()
+    if overlay is None or overlay.title is not None or now < overlay.measure_after:
+        return
+    rect = frame_rect(front)
+    if rect is None or not overlay.measure_title(rect):
+        overlay.measure_after = now + 30
+
+
+def measure_everything(overlays: dict[int, "Overlay"], taskbar) -> None:
+    """Bring each shelled window to the front and measure it, measure the
+    taskbar's hover highlight, then put back whatever was in front before.
+    Runs from Ctrl+Alt+Shift+D."""
+    previous = user32.GetForegroundWindow()
+    front_app = None
+    for hwnd, overlay in overlays.items():
+        if user32.IsIconic(hwnd) or not user32.SetForegroundWindow(hwnd):
+            continue
+        deadline = time.monotonic() + 0.6
+        while user32.GetForegroundWindow() != hwnd and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if user32.GetForegroundWindow() != hwnd:
+            continue
+        # Let the window finish painting in front.
+        time.sleep(0.25)
+        rect = frame_rect(hwnd)
+        if rect is not None:
+            overlay.title = None
+            overlay.measure_title(rect)
+            front_app = overlay.style.key
+    # The taskbar shows while a shelled window is in front. The front app's
+    # button has a highlight of its own, so hover a different one.
+    taskbar.measure_highlight(SHELLS.apps, avoid=front_app)
+    taskbar.remeasure()
+    taskbar.update(SHELLS.apps, SHELLS.dot_gap)
+    if previous:
+        user32.SetForegroundWindow(previous)
+
+
+def open_tuning() -> None:
+    """Start the dot tuning window. It keeps itself to one copy."""
+    import subprocess
+
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    exe = pythonw if pythonw.exists() else Path(sys.executable)
+    subprocess.Popen([str(exe), str(HERE / "tune.py")], cwd=str(HERE), close_fds=True)
 
 
 def claim_single_instance() -> bool:
@@ -734,6 +995,8 @@ def main() -> None:
     icons_toggle = user32.RegisterHotKey(None, HOTKEY_ICONS, MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_I)
     if icons_toggle:
         print("Taskbar icons on. Ctrl+Alt+Shift+I toggles them.", flush=True)
+    if user32.RegisterHotKey(None, HOTKEY_TUNE, MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK_D):
+        print("Ctrl+Alt+Shift+D measures windows and taskbar icons again and opens tuning.", flush=True)
 
     from taskbar import TaskbarTints
     taskbar = TaskbarTints()
@@ -750,6 +1013,10 @@ def main() -> None:
                 if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ICONS:
                     state = "on" if taskbar.toggle() else "off"
                     print(f"Taskbar icons {state}.", flush=True)
+                    continue
+                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_TUNE:
+                    measure_everything(overlays, taskbar)
+                    open_tuning()
                     continue
                 user32.TranslateMessage(byref(msg))
                 user32.DispatchMessageW(byref(msg))
@@ -781,7 +1048,8 @@ def main() -> None:
                 if rect is not None:
                     overlay.sync(rect, style)
 
-            taskbar.update(SHELLS.apps)
+            measure_in_front(overlays)
+            taskbar.update(SHELLS.apps, SHELLS.dot_gap)
 
             for hwnd in list(overlays):
                 if hwnd not in live or not user32.IsWindow(hwnd):
@@ -790,6 +1058,7 @@ def main() -> None:
     finally:
         user32.UnregisterHotKey(None, HOTKEY_QUIT)
         user32.UnregisterHotKey(None, HOTKEY_ICONS)
+        user32.UnregisterHotKey(None, HOTKEY_TUNE)
         taskbar.close()
         for overlay in overlays.values():
             overlay.close()

@@ -315,14 +315,16 @@ class CodexLogs:
 CODEX = CodexLogs()
 
 
-def _hook_sessions() -> list[tuple[str, bool, float | None, float]]:
+def _hook_sessions() -> tuple[list[tuple[str, bool, float | None, float]], dict[str, bool]]:
+    """Hook-written sessions, and the dot states tune.py is previewing."""
     now = time.time()
     window = context_window()
     found = []
+    previews: dict[str, bool] = {}
     try:
         files = list(STATUS_DIR.glob("*.json"))[:64]
     except OSError:
-        return found
+        return found, previews
     for path in files:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -336,24 +338,42 @@ def _hook_sessions() -> list[tuple[str, bool, float | None, float]]:
         if not app:
             continue
         busy = data.get("state") == "busy" and now - at < BUSY_STALE
+        if data.get("preview"):
+            previews[app] = data.get("state") == "busy"
+            continue
         used = data.get("used")
         share = min(1.0, used / window) if isinstance(used, (int, float)) and used > 0 else None
         found.append((app, busy, share, at))
-    return found
+    return found, previews
 
 
 def app_states() -> dict[str, tuple[bool, float | None]]:
     """For each app with a session: (working, share of context used)."""
     states: dict[str, tuple[bool, float | None]] = {}
     latest: dict[str, float] = {}
-    for app, busy, share, at in _hook_sessions() + CODEX.sessions():
+    sessions, previews = _hook_sessions()
+    for app, busy, share, at in sessions + CODEX.sessions():
         was_busy, last_share = states.get(app, (False, None))
         # The usage fill follows the session that moved most recently.
         if at >= latest.get(app, 0):
             latest[app] = at
             last_share = share if share is not None else last_share
         states[app] = (was_busy or busy, last_share)
+    for app, busy in previews.items():
+        states[app] = (busy, states.get(app, (False, None))[1])
     return states
+
+
+def write_preview(app: str, busy: bool) -> None:
+    """Hold an app's dot in one state while tune.py is open."""
+    STATUS_DIR.mkdir(exist_ok=True)
+    target = STATUS_DIR / f"preview-{_safe_id(app)}.json"
+    target.write_text(json.dumps({"app": app, "state": "busy" if busy else "done", "at": time.time(), "preview": True}), encoding="utf-8")
+
+
+def clear_previews() -> None:
+    for path in STATUS_DIR.glob("preview-*.json"):
+        path.unlink(missing_ok=True)
 
 
 def main() -> None:

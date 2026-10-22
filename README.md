@@ -8,7 +8,7 @@ Light click-through frames and taskbar tints so desktop windows are easy to tell
 | Claude | Blue | Georgia |
 | ChatGPT | Green | Cascadia Mono |
 
-Red and orange are in the palette too. The script asks Windows which windows belong to those apps and where they are, then draws a shell on top. Each app's taskbar icon gets a wash in its color. Clicks pass through. It does not read the screen, take screenshots, or record anything. The agent status reads only state events and token counts from each session's own log.
+Red and orange are in the palette too. The script asks Windows which windows belong to those apps and where they are, then draws a shell on top. Each app's taskbar button gets a wash in its color, in the same rounded square Windows lights up when you hover it. Clicks pass through. The only pixels it reads are the shelled apps' own taskbar buttons and the left end of their title bars, briefly, to find where each icon and app name ends. It takes no screenshots and records nothing. The agent status reads only state events and token counts from each session's own log.
 
 ## Run
 
@@ -18,7 +18,22 @@ Windows and Python 3.
 python tint.py
 ```
 
-`Ctrl+Alt+Shift+Q` quits. `Ctrl+Alt+Shift+I` toggles the taskbar icon tint.
+| Hotkey | Does |
+| --- | --- |
+| `Ctrl+Alt+Shift+Q` | Quits |
+| `Ctrl+Alt+Shift+I` | Turns the taskbar icon tint on or off |
+| `Ctrl+Alt+Shift+D` | Brings each shelled window to the front to measure it, hovers one taskbar button to measure Windows' highlight, puts your front window and mouse back, and opens tuning |
+
+## Fit
+
+tintja fits itself to each PC, so a new install needs no setup.
+
+- **Corners** follow each window's own rounding: 8 pixels at 100% scale on Windows 11, 4 for windows that ask for small corners, and square when maximized or on Windows 10.
+- **Title bar and name tag.** Apps that draw their own title bar often make it taller than Windows' standard one, so tintja measures each app's real title bar height and fits the title wash and the name tag to it, with the label centered. The tag covers the app's own logo, makes room for the label, and always ends in a gap, never partway through an icon or a word such as Cursor's File menu. tintja finds these by reading the left end of the title bar, with the shell hidden for a moment. It only does this while that window is in front, so a game or another window can't be mistaken for it. That happens the first time you click into each app, or right away with `Ctrl+Alt+Shift+D`.
+- **Taskbar wash.** The wash covers just the rounded square Windows highlights when you hover a taskbar button. `Ctrl+Alt+Shift+D` measures that square by hovering one button for a moment, and saves it in `fit.json`. Until then, tintja uses Windows 11's standard 40 by 40 square with 4-pixel corners.
+- **Working dot.** See [Dot size](#dot-size) below.
+
+`Ctrl+Alt+Shift+D` also opens the tuning window, or run `python tune.py`. It takes your taskbar's color and shows magnified, live views of each taskbar button and each window's top-left corner. Its sliders set the space under the taskbar icons, how far each app's name tag reaches, and the corner rounding, where **Match each window** follows Windows. tintja updates while you drag. **Save** keeps the changes and **Cancel** puts `shells.json` back exactly as it was. The settings are `"dot_gap"` and `"corner_radius"` at the top of `shells.json` and `"name_cover"` on each app, all in pixels at 100% scale.
 
 ## Startup
 
@@ -72,6 +87,12 @@ Put this in `~/.cursor/hooks.json`. Cursor waits for each hook, and `status.py` 
   }
 }
 ```
+
+### Dot size
+
+The half circle sits on the bottom edge of the highlight square and reaches up to just under the app icon, which also hides Windows' open-window pill. When a taskbar button first appears or changes size, tintja hides its own wash for a moment, reads that button's pixels, and finds the icon's lower edge by comparing against the taskbar's color. If a full-screen game or another window covers the taskbar, it uses Windows' standard 24-pixel icon size and tries again 30 seconds later.
+
+In the tuning window, drag **Space under icon** until the dot sits where you want, and switch between **Working** and **Done** to see both states. The default is 1.5, and a negative number lets the dot overlap the icon.
 
 ### Notes
 
