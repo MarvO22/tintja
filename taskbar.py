@@ -259,7 +259,8 @@ class IconWash:
 
     def _paint_dot(self, graphics, now: float, cooling: float | None, width: int, height: int) -> None:
         # A circle centered on the bottom edge. The bitmap cuts off its lower half.
-        r = max(3.0, min(width, height) * 0.13)
+        # Wide enough to cover Windows' open-window pill under the icon.
+        r = max(4.0, min(width, height) * 0.169)
         cx = width / 2
         glow = _blend(self.color, 0xFFFFFF, 0.85)
         dark = _blend(self.color, 0x000000, 0.4)
