@@ -1,11 +1,20 @@
-"""50% color washes on the taskbar icons for the shelled apps."""
+"""50% color washes on the taskbar icons for the shelled apps.
+
+A Claude Code session adds two marks to its app's wash: a lighter fill from
+the left that grows with the session's context use, and a half circle on the
+bottom edge that glows white while Claude works and cools to a darker shade
+of the wash when it is done. status.py supplies both.
+"""
 
 from __future__ import annotations
 
 import ctypes
+import math
 import time
 import uuid
-from ctypes import POINTER, byref, c_byte, c_int, c_long, c_uint, c_uint32, c_ushort, c_void_p, sizeof
+from ctypes import POINTER, byref, c_byte, c_float, c_int, c_long, c_uint, c_uint32, c_ushort, c_void_p, sizeof
+
+import status
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -35,6 +44,12 @@ ULW_ALPHA = 2
 BI_RGB = 0
 DIB_RGB_COLORS = 0
 PIXEL_FORMAT_32BPP_PARGB = 0x000E200B
+
+gdiplus.GdipFillEllipse.argtypes = [c_void_p, c_void_p, c_float, c_float, c_float, c_float]
+gdiplus.GdipFillEllipse.restype = c_int
+
+PULSE_SECONDS = 1.6
+COOL_SECONDS = 1.4
 
 
 class GUID(ctypes.Structure):
@@ -109,9 +124,41 @@ def _release(ptr) -> None:
         Release(_vt(ptr)[2])(ptr)
 
 
+def _blend(a: int, b: int, t: float) -> int:
+    t = min(1.0, max(0.0, t))
+    out = 0
+    for shift in (16, 8, 0):
+        ca = (a >> shift) & 0xFF
+        cb = (b >> shift) & 0xFF
+        out |= round(ca + (cb - ca) * t) << shift
+    return out
+
+
+def _argb(alpha: float, rgb: int) -> int:
+    return ((round(min(255, max(0, alpha))) & 0xFF) << 24) | (rgb & 0xFFFFFF)
+
+
+def _fill(graphics, color: int, shape, x: float, y: float, w: float, h: float) -> None:
+    if w <= 0 or h <= 0:
+        return
+    brush = c_void_p()
+    if gdiplus.GdipCreateSolidFill(color, byref(brush)) != 0:
+        return
+    try:
+        shape(graphics, brush, float(x), float(y), float(w), float(h))
+    finally:
+        gdiplus.GdipDeleteBrush(brush)
+
+
 class IconWash:
     def __init__(self, color: int):
         self.color = color
+        self.bits = None
+        # Session marks: None until a Claude Code session reports in.
+        self.busy: bool | None = None
+        self.done_at = 0.0
+        self.share: float | None = None
+        self._drawn: tuple | None = None
         self.hwnd = user32.CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             "tintja",
@@ -147,7 +194,9 @@ class IconWash:
             gdi32.DeleteObject(self.bitmap)
             self.bitmap = None
 
-    def _paint(self, width: int, height: int) -> None:
+    def _ensure_bitmap(self, width: int, height: int) -> None:
+        if self.size == (width, height) and self.bitmap:
+            return
         self._free_bitmap()
         info = BITMAPINFOHEADER()
         info.biSize = sizeof(BITMAPINFOHEADER)
@@ -159,19 +208,40 @@ class IconWash:
         bits = c_void_p()
         self.bitmap = gdi32.CreateDIBSection(self.screen_dc, byref(info), DIB_RGB_COLORS, byref(bits), None, 0)
         self.old_bitmap = gdi32.SelectObject(self.mem_dc, self.bitmap)
+        self.bits = bits
+        self.size = (width, height)
+        self._drawn = None
+
+    def _cooling(self, now: float) -> float | None:
+        """0 to 1 through the cool-down after a turn ends, else None."""
+        if self.busy is not False:
+            return None
+        k = (now - self.done_at) / COOL_SECONDS
+        return k if 0 <= k < 1 else None
+
+    def _paint(self, now: float) -> None:
+        width, height = self.size
+        if not self.bits or width <= 0 or height <= 0:
+            return
+        cooling = self._cooling(now)
+        animated = self.busy or cooling is not None
+        frame = (self.size, self.origin, self.color, self.busy, round(self.share or 0, 3))
+        if not animated and frame == self._drawn:
+            return
         image = c_void_p()
         graphics = c_void_p()
-        brush = c_void_p()
-        gdiplus.GdipCreateBitmapFromScan0(width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, bits, byref(image))
+        gdiplus.GdipCreateBitmapFromScan0(width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, self.bits, byref(image))
         try:
             gdiplus.GdipGetImageGraphicsContext(image, byref(graphics))
             gdiplus.GdipGraphicsClear(graphics, 0)
-            color = ((0x80 & 0xFF) << 24) | (self.color & 0xFFFFFF)
-            gdiplus.GdipCreateSolidFill(color, byref(brush))
-            gdiplus.GdipFillRectangle(graphics, brush, 0, 0, float(width), float(height))
+            gdiplus.GdipSetSmoothingMode(graphics, 4)
+            rect = gdiplus.GdipFillRectangle
+            _fill(graphics, _argb(0x80, self.color), rect, 0, 0, width, height)
+            if self.share:
+                _fill(graphics, _argb(0x2E, 0xFFFFFF), rect, 0, 0, width * self.share, height)
+            if self.busy is not None:
+                self._paint_dot(graphics, now, cooling, width, height)
         finally:
-            if brush:
-                gdiplus.GdipDeleteBrush(brush)
             if graphics:
                 gdiplus.GdipDeleteGraphics(graphics)
             if image:
@@ -184,16 +254,49 @@ class IconWash:
             self.hwnd, self.screen_dc, byref(dest), byref(size),
             self.mem_dc, byref(origin), 0, byref(blend), ULW_ALPHA,
         )
+        self._drawn = frame
 
-    def place(self, x: int, y: int, w: int, h: int, color: int) -> None:
+    def _paint_dot(self, graphics, now: float, cooling: float | None, width: int, height: int) -> None:
+        # A circle centered on the bottom edge. The bitmap cuts off its lower half.
+        r = max(3.0, min(width, height) * 0.13)
+        cx = width / 2
+        glow = _blend(self.color, 0xFFFFFF, 0.85)
+        dark = _blend(self.color, 0x000000, 0.4)
+        if self.busy:
+            s = 0.5 - 0.5 * math.cos(2 * math.pi * (now % PULSE_SECONDS) / PULSE_SECONDS)
+            core = _blend(self.color, 0xFFFFFF, 0.7 + 0.3 * s)
+            halo = 0x28 + 0x50 * s
+        elif cooling is not None:
+            ease = cooling * cooling * (3 - 2 * cooling)
+            core = _blend(glow, dark, ease)
+            halo = 0x50 * (1 - ease)
+        else:
+            core = dark
+            halo = 0
+        ellipse = gdiplus.GdipFillEllipse
+        if halo:
+            big = r * 2.0
+            _fill(graphics, _argb(halo, 0xFFFFFF), ellipse, cx - big, height - big, big * 2, big * 2)
+        _fill(graphics, _argb(0xF0, core), ellipse, cx - r, height - r, r * 2, r * 2)
+
+    def mark(self, state: tuple[bool, float | None] | None, now: float) -> None:
+        busy, share = state if state is not None else (None, None)
+        if self.busy and busy is False:
+            self.done_at = now
+        self.busy = busy
+        self.share = share
+
+    def place(self, x: int, y: int, w: int, h: int, color: int, now: float) -> None:
         if color != self.color:
             self.color = color
-            self.size = (0, 0)
-        if self.size != (w, h) or self.origin != (x, y):
-            self.origin = (x, y)
-            self._paint(w, h)
-            self.size = (w, h)
+        self.origin = (x, y)
+        self._ensure_bitmap(w, h)
+        self._paint(now)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+
+    def animate(self, now: float) -> None:
+        if self.busy or self._cooling(now) is not None:
+            self._paint(now)
 
 
 class TaskbarTints:
@@ -227,27 +330,32 @@ class TaskbarTints:
 
     def update(self, apps: dict) -> None:
         now = time.monotonic()
-        if not self.enabled or now < self._next_scan:
+        if not self.enabled:
             return
-        self._next_scan = now + 0.4
-        found = self._buttons(apps)
-        live = set()
-        for key, (x, y, w, h, color) in found.items():
-            live.add(key)
-            wash = self._washes.get(key)
-            if wash is None:
-                wash = IconWash(color)
-                self._washes[key] = wash
-            wash.place(x, y, w, h, color)
-        for key in list(self._washes):
-            if key not in live:
-                self._washes.pop(key).close()
+        if now >= self._next_scan:
+            self._next_scan = now + 0.4
+            sessions = status.app_states()
+            found = self._buttons(apps)
+            live = set()
+            for key, (x, y, w, h, color, app) in found.items():
+                live.add(key)
+                wash = self._washes.get(key)
+                if wash is None:
+                    wash = IconWash(color)
+                    self._washes[key] = wash
+                wash.mark(sessions.get(app), now)
+                wash.place(x, y, w, h, color, now)
+            for key in list(self._washes):
+                if key not in live:
+                    self._washes.pop(key).close()
+        for wash in self._washes.values():
+            wash.animate(now)
 
-    def _buttons(self, apps: dict) -> dict[tuple, tuple[int, int, int, int, int]]:
+    def _buttons(self, apps: dict) -> dict[tuple, tuple[int, int, int, int, int, str]]:
         if not self._automation:
             return {}
-        labels = [(style.label.casefold(), style.color) for style in apps.values() if style.label]
-        found: dict[tuple, tuple[int, int, int, int, int]] = {}
+        labels = [(style.label.casefold(), (style.color, style.key)) for style in apps.values() if style.label]
+        found: dict[tuple, tuple[int, int, int, int, int, str]] = {}
         trays = []
 
         def collect(hwnd, _lparam):
@@ -283,13 +391,14 @@ class TaskbarTints:
                     if not label or rect is None:
                         continue
                     folded = label.casefold()
-                    color = _matching_color(folded, labels)
-                    if color is None:
+                    match = _matching_color(folded, labels)
+                    if match is None:
                         continue
+                    color, app = match
                     x, y, w, h = rect
                     if not (8 <= w <= 96 and 8 <= h <= 96):
                         continue
-                    found[(folded.split(" - ", 1)[0], x // 8, y // 8)] = (x, y, w, h, color)
+                    found[(folded.split(" - ", 1)[0], x // 8, y // 8)] = (x, y, w, h, color, app)
             finally:
                 _release(array)
                 _release(condition)
@@ -297,10 +406,10 @@ class TaskbarTints:
         return found
 
 
-def _matching_color(name: str, labels: list[tuple[str, int]]) -> int | None:
-    for label, color in labels:
+def _matching_color(name: str, labels: list[tuple[str, tuple[int, str]]]) -> tuple[int, str] | None:
+    for label, match in labels:
         if name == label or name.startswith(label + " ") or name.startswith(label + "-"):
-            return color
+            return match
     return None
 
 
