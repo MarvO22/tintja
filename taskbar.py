@@ -1,9 +1,10 @@
 """50% color washes on the taskbar icons for the shelled apps.
 
-A Claude Code session adds two marks to its app's wash: a lighter fill from
-the left that grows with the session's context use, and a half circle on the
-bottom edge that glows white while Claude works and cools to a darker shade
-of the wash when it is done. status.py supplies both.
+An agent session (Claude Code, Cursor, or Codex) adds two marks to its app's
+wash: a lighter fill from the left that grows with the session's context use,
+and a half circle on the bottom edge that glows white while the agent works
+and cools to a darker shade of the wash when it is done. status.py supplies
+both.
 """
 
 from __future__ import annotations

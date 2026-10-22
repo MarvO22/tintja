@@ -3,8 +3,8 @@
 Light click-through frames for desktop windows. The default shells are the
 four mask colors: blue, red, orange, and purple. Edit shells.json to change
 a color, a typeface, or which app wears which shell. Ctrl+Alt+Shift+Q quits.
-Taskbar icons get a wash too, with Claude Code's working dot and context
-fill on top (see taskbar.py and status.py).
+Taskbar icons get a wash too, with an agent working dot and context fill on
+top for Claude Code, Cursor, and Codex (see taskbar.py and status.py).
 """
 
 from __future__ import annotations

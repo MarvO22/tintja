@@ -1,13 +1,16 @@
-"""Claude Code session state for tintja.
+"""Agent session state for tintja.
 
-Claude Code hooks run this file. It writes one small JSON file per session
-into status/ saying which shelled app hosts the session, whether Claude is
-working, and how full the session's context is. tintja reads those files to
-draw the working dot and the usage fill on the taskbar icons.
+Claude Code and Cursor hooks run this file. It writes one small JSON file per
+session into status/ saying which shelled app hosts the session, whether the
+agent is working, and how full the session's context is. tintja reads those
+files to draw the working dot and the usage fill on the taskbar icons.
 
 The host app is found by walking up the parent processes until one matches
 an app in shells.json, so a session in Cursor's terminal lights Cursor and a
 session in the Claude app lights Claude.
+
+The ChatGPT app here is OpenAI's Codex app, which needs no hooks: tintja
+follows the session logs it already writes under ~/.codex/sessions.
 """
 
 from __future__ import annotations
@@ -35,6 +38,14 @@ FORGET_AFTER = 24 * 60 * 60
 
 BUSY_EVENTS = {"UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure"}
 DONE_EVENTS = {"Stop", "StopFailure", "Notification"}
+END_EVENTS = {"SessionEnd"}
+# Cursor's hook names. Its transcripts carry no token counts, so no usage.
+CURSOR_BUSY = {"beforeSubmitPrompt", "postToolUse", "postToolUseFailure"}
+CURSOR_DONE = {"stop"}
+CURSOR_END = {"sessionEnd"}
+
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+CODEX_APP = "chatgpt.exe"
 
 TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -175,20 +186,21 @@ def _safe_id(text: str) -> str:
 
 
 def record(payload: dict, started: float) -> None:
-    session = _safe_id(str(payload.get("session_id") or ""))
+    session = _safe_id(str(payload.get("session_id") or payload.get("conversation_id") or ""))
     event = str(payload.get("hook_event_name") or "")
     if not session:
         return
     target = STATUS_DIR / f"{session}.json"
-    if event == "SessionEnd":
+    if event in END_EVENTS or event in CURSOR_END:
         target.unlink(missing_ok=True)
         return
-    if event in BUSY_EVENTS:
+    if event in BUSY_EVENTS or event in CURSOR_BUSY:
         state = "busy"
-    elif event in DONE_EVENTS:
+    elif event in DONE_EVENTS or event in CURSOR_DONE:
         state = "done"
     else:
         return
+    cursor = event[:1].islower()
     previous: dict = {}
     try:
         previous = json.loads(target.read_text(encoding="utf-8"))
@@ -200,25 +212,117 @@ def record(payload: dict, started: float) -> None:
     app = previous.get("app") or host_app()
     if not app:
         return
-    used = context_used(str(payload.get("transcript_path") or ""))
+    used = None if cursor else context_used(str(payload.get("transcript_path") or ""))
     if used is None:
         used = previous.get("used")
     STATUS_DIR.mkdir(exist_ok=True)
     temp = target.with_suffix(f".{os.getpid()}.tmp")
     temp.write_text(json.dumps({"app": app, "state": state, "at": started, "used": used}), encoding="utf-8")
-    os.replace(temp, target)
+    # Windows refuses the swap while another process has the file open.
+    try:
+        for attempt in range(5):
+            try:
+                os.replace(temp, target)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        temp.unlink(missing_ok=True)
 
 
-def app_states() -> dict[str, tuple[bool, float | None]]:
-    """For each app with a session: (working, share of context used)."""
+class CodexLogs:
+    """Follows the Codex app's session logs.
+
+    Each turn writes a task_started event, token_count events with the
+    model's context window, and task_complete or turn_aborted at the end.
+    Files are read from where the last read stopped.
+    """
+
+    RESCAN_SECONDS = 15
+    FIRST_READ = 2_000_000
+
+    def __init__(self) -> None:
+        self._files: dict[Path, dict] = {}
+        self._next_scan = 0.0
+
+    def _rescan(self, now: float) -> None:
+        self._next_scan = now + self.RESCAN_SECONDS
+        try:
+            paths = list(CODEX_SESSIONS.glob("*/*/*/*.jsonl"))
+        except OSError:
+            return
+        live = set()
+        for path in paths:
+            try:
+                if now - path.stat().st_mtime > FORGET_AFTER:
+                    continue
+            except OSError:
+                continue
+            live.add(path)
+            self._files.setdefault(path, {"offset": None, "busy": False, "share": None})
+        for path in list(self._files):
+            if path not in live:
+                del self._files[path]
+
+    def _read(self, path: Path, state: dict, size: int) -> None:
+        offset = state["offset"]
+        if offset is None or offset > size:
+            offset = max(0, size - self.FIRST_READ)
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(size - offset)
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        state["offset"] = offset + end + 1
+        for line in chunk[: end + 1].decode("utf-8", "replace").splitlines():
+            if '"event_msg"' not in line:
+                continue
+            try:
+                payload = json.loads(line).get("payload") or {}
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            kind = payload.get("type")
+            if kind == "task_started":
+                state["busy"] = True
+            elif kind in ("task_complete", "turn_aborted"):
+                state["busy"] = False
+            elif kind == "token_count":
+                info = payload.get("info") or {}
+                used = (info.get("last_token_usage") or {}).get("input_tokens")
+                window = info.get("model_context_window")
+                if isinstance(used, int) and isinstance(window, int) and window > 0:
+                    state["share"] = min(1.0, used / window)
+
+    def sessions(self) -> list[tuple[str, bool, float | None, float]]:
+        now = time.time()
+        if now >= self._next_scan:
+            self._rescan(now)
+        found = []
+        for path, state in self._files.items():
+            try:
+                stat = path.stat()
+                if stat.st_size != state.get("size"):
+                    self._read(path, state, stat.st_size)
+                    state["size"] = stat.st_size
+            except OSError:
+                continue
+            busy = state["busy"] and now - stat.st_mtime < BUSY_STALE
+            found.append((CODEX_APP, busy, state["share"], stat.st_mtime))
+        return found
+
+
+CODEX = CodexLogs()
+
+
+def _hook_sessions() -> list[tuple[str, bool, float | None, float]]:
     now = time.time()
     window = context_window()
-    states: dict[str, tuple[bool, float | None]] = {}
-    latest: dict[str, float] = {}
+    found = []
     try:
         files = list(STATUS_DIR.glob("*.json"))[:64]
     except OSError:
-        return states
+        return found
     for path in files:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -234,6 +338,15 @@ def app_states() -> dict[str, tuple[bool, float | None]]:
         busy = data.get("state") == "busy" and now - at < BUSY_STALE
         used = data.get("used")
         share = min(1.0, used / window) if isinstance(used, (int, float)) and used > 0 else None
+        found.append((app, busy, share, at))
+    return found
+
+
+def app_states() -> dict[str, tuple[bool, float | None]]:
+    """For each app with a session: (working, share of context used)."""
+    states: dict[str, tuple[bool, float | None]] = {}
+    latest: dict[str, float] = {}
+    for app, busy, share, at in _hook_sessions() + CODEX.sessions():
         was_busy, last_share = states.get(app, (False, None))
         # The usage fill follows the session that moved most recently.
         if at >= latest.get(app, 0):
@@ -249,8 +362,16 @@ def main() -> None:
         payload = json.loads(sys.stdin.read(1_000_000) or "{}")
     except (json.JSONDecodeError, OSError, ValueError):
         return
-    if isinstance(payload, dict):
+    if not isinstance(payload, dict):
+        return
+    try:
         record(payload, started)
+    finally:
+        # Cursor waits on its hooks and reads a JSON answer. Claude Code
+        # runs these in the background and ignores the output.
+        if str(payload.get("hook_event_name") or "")[:1].islower():
+            reply = {"continue": True} if payload.get("hook_event_name") == "beforeSubmitPrompt" else {}
+            print(json.dumps(reply), flush=True)
 
 
 if __name__ == "__main__":
