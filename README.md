@@ -45,14 +45,16 @@ Add these to `~/.claude/settings.json`, with your own paths to Python and `statu
 
 ```json
 "hooks": {
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "async": true, "timeout": 10 }] }],
-  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "async": true, "timeout": 10 }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "async": true, "timeout": 10 }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "async": true, "timeout": 10 }] }],
-  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "async": true, "timeout": 10 }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "C:\\Python314\\python.exe", "args": ["D:\\DEV\\app-tint\\status.py"], "timeout": 5 }] }]
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "async": true, "timeout": 10 }] }],
+  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "async": true, "timeout": 10 }] }],
+  "Notification":     [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "async": true, "timeout": 10 }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "async": true, "timeout": 10 }] }],
+  "StopFailure":      [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "async": true, "timeout": 10 }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "C:/Python314/python.exe D:/DEV/app-tint/status.py", "timeout": 5 }] }]
 }
 ```
+
+Keep the script path inside `command`, with forward slashes. Cursor also runs the hooks in `~/.claude/settings.json`, and it ignores an `args` list.
 
 ### Cursor hooks
 

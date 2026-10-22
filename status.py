@@ -358,20 +358,19 @@ def app_states() -> dict[str, tuple[bool, float | None]]:
 
 def main() -> None:
     started = time.time()
+    payload: object = {}
     try:
-        payload = json.loads(sys.stdin.read(1_000_000) or "{}")
+        # Cursor's input starts with a UTF-8 byte order mark.
+        payload = json.loads(sys.stdin.buffer.read(1_000_000).decode("utf-8-sig") or "{}")
+        if isinstance(payload, dict):
+            record(payload, started)
     except (json.JSONDecodeError, OSError, ValueError):
-        return
-    if not isinstance(payload, dict):
-        return
-    try:
-        record(payload, started)
+        pass
     finally:
         # Cursor waits on its hooks and reads a JSON answer. Claude Code
-        # runs these in the background and ignores the output.
-        if str(payload.get("hook_event_name") or "")[:1].islower():
-            reply = {"continue": True} if payload.get("hook_event_name") == "beforeSubmitPrompt" else {}
-            print(json.dumps(reply), flush=True)
+        # accepts an empty object.
+        event = payload.get("hook_event_name") if isinstance(payload, dict) else None
+        print(json.dumps({"continue": True} if event == "beforeSubmitPrompt" else {}), flush=True)
 
 
 if __name__ == "__main__":
